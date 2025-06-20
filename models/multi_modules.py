@@ -8,8 +8,9 @@ from utils.RiSA_dataloader import _cuda
 
 from dgl.nn.pytorch import GATConv
 
-
+#文脈理解のため
 class Encoder(nn.Module):
+    #初期設定
     def __init__(self, input_size, hidden_size, attention_out_size, dropout, n_layers=1):
         super(Encoder, self).__init__()
         self.input_size = input_size
@@ -18,7 +19,9 @@ class Encoder(nn.Module):
         self.dropout = dropout
         self.dropout_layer = nn.Dropout(dropout)
         self.embedding = nn.Embedding(input_size, hidden_size, padding_idx=PAD_token)
+        #双方向RNN
         self.gru = nn.GRU(hidden_size, hidden_size, n_layers, dropout=dropout, bidirectional=True)
+        #特徴量を調整する線形層
         self.W = nn.Linear(2 * hidden_size + attention_out_size, hidden_size)
         self.attention = SelfAttention(
             hidden_size, hidden_size, attention_out_size, dropout_rate=dropout
@@ -31,26 +34,36 @@ class Encoder(nn.Module):
         """Get cell states and hidden states."""
         return _cuda(torch.zeros(2, bsz, self.hidden_size))
 
+    #エンコード処理本体
     def forward(self, input_seqs, input_lengths, hidden=None):
+        #単語をベクトル変換
         embedded = self.embedding(input_seqs.contiguous().view(input_seqs.size(0), -1).long())
         embedded = embedded.view(input_seqs.size() + (embedded.size(-1),))
         embedded = torch.sum(embedded, 2).squeeze(2)
+        #ベクトルを文の形に調整しドロップアウト
         embedded = self.dropout_layer(embedded)
         hidden = self.get_state(input_seqs.size(1))
+        #Attention入力
         attention_in = embedded.transpose(0, 1)
         attention_out_hidden = self.attention(attention_in)
         if input_lengths:
             embedded = nn.utils.rnn.pack_padded_sequence(embedded, input_lengths, batch_first=False)
+        #GRUで前後の内容を基に文脈理解
         outputs, hidden = self.gru(embedded, hidden)
         if input_lengths:
             outputs, _ = nn.utils.rnn.pad_packed_sequence(outputs, batch_first=False)
         outputs = outputs.transpose(0, 1)
+        #AttentionとGRUを結合（文全体の要約ベクトルも生成）
         cat_hidden = torch.cat([outputs, attention_out_hidden], dim=-1)
         sent_represent = self.sent_attention(cat_hidden, input_lengths)
+        #線形層でサイズ調整して出力
         cat_hidden, sent_represent = self.W(cat_hidden), self.W(sent_represent)
+        #各単語の文脈付きベクトルと文全体の意味を表すベクトル
         return cat_hidden, sent_represent
 
-
+#知識グラフ（KB）処理の中核を担うクラス
+#対話の履歴や知識ベースの情報をグラフとして処理し、意味のあるベクトル表現を生成
+#知識ベース＋文脈＋会話履歴をグラフとして処理する
 class GraphEK(nn.Module):
     def __init__(self, vocab, embedding_dim, dropout,
                  num_edges, graph_hidden_size, graph_out_size, num_heads,
@@ -60,21 +73,27 @@ class GraphEK(nn.Module):
         self.dropout = dropout
         self.dropout_layer = nn.Dropout(dropout)
         self.embedding = nn.Embedding(vocab, embedding_dim, padding_idx=PAD_token)
+        #HANはエッジの種類に応じたGATConvを通して情報をまとめる
         self.HAN = HAN(num_edges, embedding_dim, graph_hidden_size, graph_out_size, num_heads, self.dropout)
         self.softmax = nn.Softmax(dim=1)
         self.sigmoid = nn.Sigmoid()
         for idx in domain2index.values():
             node_li = nn.Linear(embedding_dim, embedding_dim)
             self.add_module("node_{}".format(idx), node_li)
+        #各ドメインごとのノード変換層設定
         self.node_lis = AttrProxy(self, "node_")
-
+                     
+    #グラフのノードに、会話の隠れ状態を加える
+    #会話の流れがKBの意味に影響するから、文脈の埋込みも加える
     def add_lm_embedding(self, full_memory, kb_len, conv_len, hiddens, domain_num):
         # full_memory:(bs, node_num, hidden), kb_len:(bs), hiddens:(bs, dh_node_num, hidden)
         for bi in range(full_memory.size(0)):
             start, end = kb_len[bi] + domain_num[bi], kb_len[bi] + domain_num[bi] + conv_len[bi]
             full_memory[bi, start:end, :] = full_memory[bi, start:end, :] + hiddens[bi, :conv_len[bi], :]
+        #文脈情報が埋め込まれた会話付きノード表現
         return full_memory
 
+    #ドメイン毎に、関連するノードだけを取り出し、Linear層で変換
     def node_linear(self, feat_in, span: dict):
         """
         not for batch version
@@ -83,10 +102,14 @@ class GraphEK(nn.Module):
         kb+history - 100
         node linear 100*128 domain
         domain node
+        feat_in：ノードの特徴量テンソル（例：[ノード数, 次元数]）
+        span：どのノードがどのドメインに属するかを示す辞書
+        sp：そのドメインに属するノードの位置リス
         """
         feat_out = feat_in.clone()
         for idx, sp in span.items():
             node_list = []
+            #ノードが複数の位置にまたがっているとき
             if len(sp) > 1:
                 node_list.append(feat_in[sp[0]: sp[0] + 1])
                 for kk in sp[1:]:
@@ -95,6 +118,7 @@ class GraphEK(nn.Module):
                 l_in = torch.cat(node_list)
                 out = self.node_lis[idx](l_in)
                 feat_out[sp[0]] = out[0]
+                #最初の位置に変換後の最初のベクトルを入れる
                 out_bi = 1
                 for kk in sp[1:]:
                     bi, ed = kk
@@ -104,8 +128,10 @@ class GraphEK(nn.Module):
                 bi, ed = sp[0]
                 l_in = feat_in[bi: ed + 1]
                 feat_out[bi: ed + 1] = self.node_lis[idx](l_in)
+        #すべてのドメインごとのノードに変換をかけた結果を返す
         return feat_out
 
+    #特定の位置にある単語列を合成し、必要に応じて足し合わせる（系列データをドメイン単位で再構成（合成）する前処理）
     def cross_embed(self, feat_in, seq_len: list, look_up: list):
         """
         use seq_len to split the features, use look_up to check if it need to sum
@@ -115,31 +141,47 @@ class GraphEK(nn.Module):
 
         for i in range(batch_size):
             sentence = self.embedding(feat_in[i].long())
+            #sp_tuple：seq_lenでベクトルを分割、line_look_up：各分割に対応する「合成が必要か」のリスト
             sum_up_line, sp_tuple, line_look_up = [], torch.split(sentence, seq_len[i], dim=0), look_up[i]
             len_tuple = len(sp_tuple)
             assert len_tuple == len(line_look_up)
+            #単語列が合成必要かどうかを分割ごとに処理
             for k in range(len_tuple):
                 if line_look_up[k]:
                     sum_up_line.append(torch.sum(sp_tuple[k], keepdim=True, dim=0))
                 else:
                     sum_up_line.append(sp_tuple[k])
             sum_up.append(torch.cat(sum_up_line, dim=0))
+        #すべてのサンプルに共通の長さにパディング
         max_len = max([sup.shape[0] for sup in sum_up])
+        #すべてのベクトルを (max_len, 4, emb_dim) にそろえて保存
         for i in range(batch_size):
             zeros = _cuda(torch.zeros((max_len, 4, self.embedding_dim)))
             zeros[:sum_up[i].shape[0], :, :] = sum_up[i]
             sum_up[i] = zeros.unsqueeze(0)
         return torch.cat(sum_up, dim=0)
 
+    #重要（会話＋知識ベース（story）を、グラフ構造を使って意味のあるベクトルに変換する処理）
     def load_memory(self, story, kb_len, conv_len, dh_outputs,
                     graphs, node_nums: list, domain_span: list, domain_num: list):
+    """
+    story:会話＋KB-over-KBの情報（単語ID）バッチ×ノード数×4などの構造
+    kb_len	各バッチのKB部分の長さ（何個あるか）
+    conv_len	各バッチの会話部分の長さ
+    dh_outputs	会話履歴（エンコーダ出力）のベクトル
+    domain_span	各ドメインがどのノード範囲にあるか
+    """
+        #埋込みと形状変換
         batch_size = len(story)
         story_size = story.size()
         embed_A = self.embedding(story.contiguous().view(story_size[0], -1))
         embed_A = embed_A.view(story_size + (embed_A.size(-1),))
         embed_A = torch.sum(embed_A, 2).squeeze(2)
+        #会話履歴のベクトルをKBノードに加える（dh_outputs（会話の隠れ状態）を加える）
+        #文脈に沿ったグラフに
         embed_A = self.add_lm_embedding(embed_A, kb_len, conv_len, dh_outputs, domain_num)
         features = self.dropout_layer(embed_A)
+        #ドメイン毎のノードを個別に変換
         linear_out_features = []
         self.graph_out_features = features.clone()
         for i in range(batch_size):
@@ -148,6 +190,7 @@ class GraphEK(nn.Module):
             except TypeError:
                 print(domain_span[i])
                 print(node_nums[i])
+        #HANに通してノードの表現をアップデート（グラフ構造と変換済みのノードをHANに通して、注意機構を使った新しいノード表現を得る）
         graph_out = self.HAN(graphs, torch.cat(linear_out_features))
         begin = 0
         for i in range(batch_size):
@@ -155,11 +198,14 @@ class GraphEK(nn.Module):
             begin += node_nums[i]
         return
 
+    #Decoderから渡された質問ベクトル query_vector と　各ノードがどれだけ重要か（softmaxスコア）を出力する
     def forward(self, query_vector):
         u = [query_vector]
         m_A = self.graph_out_features
+        #クエリベクトルの次元を調整
         if len(list(u[-1].size())) == 1:
             u[-1] = u[-1].unsqueeze(0)
+        #query_vector の形を (batch, ノード数, 次元) に揃える
         u_temp = u[-1].unsqueeze(1).expand_as(m_A)
         prob_logits = torch.sum(m_A * u_temp, 2)
         prob_soft = self.softmax(prob_logits)
